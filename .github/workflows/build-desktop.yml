@@ -1,0 +1,239 @@
+name: Build desktop client and publish release
+
+# Builds the ZCode desktop client and publishes the installers to this repository's
+# GitHub Releases. The platform matrix mirrors the artifacts published upstream:
+# Windows x64 (.exe) and macOS arm64 (.dmg).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version embedded in the app (defaults to package.json version)"
+        required: false
+        type: string
+      tag:
+        description: "Release tag (defaults to v<version>)"
+        required: false
+        type: string
+      draft:
+        description: "Create the release as a draft"
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark the release as a pre-release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: Resolve release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version and tag
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          package_version="$(node -p "require('./package.json').version")"
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            tag="$REF_NAME"
+            version="${tag#v}"
+          else
+            version="${INPUT_VERSION:-$package_version}"
+            version="${version#v}"
+            tag="${INPUT_TAG:-v$version}"
+          fi
+
+          version="${version#v}"
+          tag="v${tag#v}"
+
+          if [ -z "$version" ] || [ -z "$tag" ]; then
+            echo "::error::version and tag must not be empty"
+            exit 1
+          fi
+
+          semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          if ! [[ "$version" =~ $semver_re ]]; then
+            echo "::error::Invalid semver version: $version"
+            exit 1
+          fi
+          if ! [[ "$tag" =~ ^v${semver_re#^} ]]; then
+            echo "::error::Release tag must look like vX.Y.Z (optionally with -suffix): $tag"
+            exit 1
+          fi
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::Release tag ($tag) must equal v<version> (v$version)"
+            exit 1
+          fi
+
+          # On manual runs the tag may already exist. Do not attach artifacts built
+          # from the current commit to a tag that points somewhere else.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            existing_sha="$(git ls-remote --tags origin "refs/tags/$tag^{}" | cut -f1)"
+            if [ -z "$existing_sha" ]; then
+              existing_sha="$(git ls-remote --tags origin "refs/tags/$tag" | cut -f1)"
+            fi
+            if [ -n "$existing_sha" ] && [ "$existing_sha" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag $tag already exists at $existing_sha, but this run builds $GITHUB_SHA"
+              exit 1
+            fi
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Building version $version with release tag $tag"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: metadata
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-latest
+            platform: win
+            arch: x64
+            artifact: zcode-windows-x64
+          - name: macOS arm64
+            runner: macos-15
+            platform: mac
+            arch: arm64
+            artifact: zcode-macos-arm64
+    env:
+      CI: "true"
+      HUSKY: "0"
+      ZCODE_ENV: production
+      ZCODE_TARGET_OS: ${{ matrix.platform }}
+      ZCODE_TARGET_ARCH: ${{ matrix.arch }}
+      NODE_OPTIONS: --max-old-space-size=8192
+      # GitHub-hosted runners reach GitHub releases more reliably than the China
+      # mirrors that the repository uses by default.
+      ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
+      ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Pin application version
+        shell: bash
+        env:
+          BUILD_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          node -e '
+          const fs = require("node:fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          pkg.version = process.env.BUILD_VERSION;
+          fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
+          console.log(`[version] package.json -> ${pkg.version}`);
+          '
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # This single command runs prepare:runtime-assets, the production build,
+      # electron-builder, runtime dependency verification and the bundle size audit.
+      - name: Build and package
+        run: pnpm bundle:desktop -- --os ${{ matrix.platform }} --arch ${{ matrix.arch }}
+
+      - name: Upload installers and update metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          path: |
+            packages/desktop/dist/*.exe
+            packages/desktop/dist/*.exe.blockmap
+            packages/desktop/dist/*.dmg
+            packages/desktop/dist/*.zip
+            packages/desktop/dist/*.zip.blockmap
+            packages/desktop/dist/latest*.yml
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - metadata
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Flatten release assets
+        run: |
+          mkdir -p release-upload
+          find release-assets -type f -exec cp {} release-upload/ \;
+          find release-upload -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          name: ${{ needs.metadata.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          draft: ${{ inputs.draft || false }}
+          prerelease: ${{ inputs.prerelease || false }}
+          fail_on_unmatched_files: true
+          files: release-upload/*
+          body: |
+            Automated desktop build from commit `${{ github.sha }}`.
+
+            | Platform | Installer |
+            | --- | --- |
+            | Windows x64 | `ZCode-${{ needs.metadata.outputs.version }}-win-x64.exe` |
+            | macOS arm64 | `ZCode-${{ needs.metadata.outputs.version }}-mac-arm64.dmg` |
+
+            These installers are built from a fork and are **unsigned**. Windows
+            SmartScreen may warn; on macOS you may need to right-click the app and
+            choose **Open** the first time.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
