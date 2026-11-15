@@ -116,8 +116,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Pin Windows to windows-2025: scripts/windows-runtime-host compiles the
+          # installer helpers with CMake "-G 'Visual Studio 17 2022'", which requires a
+          # VS 2022 instance. windows-latest was flipped to the VS2026-only image
+          # (windows-2025-vs2026, VS Enterprise 18.x) and no longer has one.
           - name: Windows x64
-            runner: windows-latest
+            runner: windows-2025
             platform: win
             arch: x64
             artifact: zcode-windows-x64
