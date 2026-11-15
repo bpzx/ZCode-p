@@ -159,6 +159,26 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
+      # 3.18.x 起 prepare:runtime-assets 会在 Windows 上用 CMake "-G 'Visual Studio 17 2022'"
+      # 现场编译 runtime host。GitHub 的 windows-2025/windows-latest 镜像已切到 VS2026（18.x），
+      # 没有 VS 17 实例；检测不到时补装 VS2022 Build Tools 的 VC 工作负载，保证镜像漂移不再影响构建。
+      - name: Ensure Visual Studio 2022 C++ toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $instance = $null
+          if (Test-Path $vswhere) {
+            $instance = & $vswhere -latest -products * -version '[17.0,18.0)' -requires 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' -property installationPath
+          }
+          if ($instance) {
+            Write-Host "VS 2022 C++ instance found: $instance"
+          } else {
+            Write-Host "No VS 2022 (17.x) C++ instance found; installing VS 2022 Build Tools with VC workload..."
+            choco install -y --no-progress visualstudio2022buildtools
+            choco install -y --no-progress visualstudio2022-workload-vctools
+          }
+
       - name: Pin application version
         shell: bash
         env:
