@@ -39,14 +39,45 @@ export function extractPrebuiltArchive({ archivePath, archiveExt, extractDir, cw
   mkdirSync(extractDir, { recursive: true });
   if (archiveExt === "zip") {
     if (process.platform === "win32") {
-      runCommand("powershell.exe", [
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        `Expand-Archive -LiteralPath '${archivePath.replaceAll("'", "''")}' -DestinationPath '${extractDir.replaceAll("'", "''")}' -Force`,
-      ]);
+      // Bugfix: GitHub Windows 镜像的 PSModulePath 会带上 PowerShell 7 的模块目录，
+      // Windows PowerShell 5.1 调用 Expand-Archive 时因此加载了 PS7 的
+      // Microsoft.PowerShell.Archive，而它内部使用的 3 参数
+      // ZipFileExtensions.ExtractToDirectory 只在 .NET Core 存在，最终报
+      // "Cannot find an overload ... argument count: 3"，解压出空目录后再报
+      // "Failed to locate <binary> in extracted archive"。
+      // 优先用系统自带 bsdtar（System32\tar.exe 原生支持 zip，不经过 PowerShell 模块）；
+      // 老系统缺少 tar.exe 时回退到 Windows PowerShell，并把 PSModulePath 收窄到
+      // 5.1 自带的模块目录，避免再发现不兼容的 PS7 模块。
+      const zipCwd = cwd ?? process.cwd();
+      const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
+      try {
+        runCommand(
+          join(windowsRoot, "System32", "tar.exe"),
+          ["-xf", resolveTarArchiveArg(archivePath, zipCwd), "-C", toTarPosixPath(extractDir)],
+          { cwd: zipCwd },
+        );
+        return;
+      } catch (error) {
+        console.warn(`[warn] bsdtar 解压 zip 失败，回退到 Windows PowerShell: ${String(error)}`);
+      }
+
+      runCommand(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          `Expand-Archive -LiteralPath '${archivePath.replaceAll("'", "''")}' -DestinationPath '${extractDir.replaceAll("'", "''")}' -Force`,
+        ],
+        {
+          env: {
+            ...process.env,
+            PSModulePath: join(windowsRoot, "System32", "WindowsPowerShell", "v1.0", "Modules"),
+          },
+        },
+      );
       return;
     }
 
