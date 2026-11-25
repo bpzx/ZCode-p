@@ -193,8 +193,30 @@ jobs:
           console.log(`[version] package.json -> ${pkg.version}`);
           '
 
+      # pnpm#12880 / pnpm#10179：node-linker=hoisted 下 pnpm 10 偶发
+      # "ERR_PNPM_ENOENT ... rename '.../_tmp_*' -> '.../esbuild'" 竞态，与依赖内容无关，
+      # pnpm 11 才修复；本仓库 packageManager 与 lockfile 绑定 10.33.2，不能直接升大版本。
+      # 只对这种特定报错重试（并清掉半成品 node_modules），其它安装错误立即失败，避免掩盖真实问题。
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            log="${RUNNER_TEMP:-/tmp}/pnpm-install-$attempt.log"
+            if pnpm install --frozen-lockfile 2>&1 | tee "$log"; then
+              exit 0
+            fi
+            status=${PIPESTATUS[0]}
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            if ! grep -q "ERR_PNPM_ENOENT" "$log" || ! grep -q "_tmp_" "$log"; then
+              exit "$status"
+            fi
+            echo "::warning::pnpm install hit the hoisted-linker rename race (attempt $attempt/3); retrying on a clean node_modules"
+            rm -rf node_modules
+          done
+          exit 1
 
       # This single command runs prepare:runtime-assets, the production build,
       # electron-builder, runtime dependency verification and the bundle size audit.
